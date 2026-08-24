@@ -142,6 +142,8 @@ def main():
                         help='每天每个 sector 保留的最大帖子数')
     parser.add_argument('--save_matched', action='store_true',
                         help='是否保存匹配后的中间表 matched_all.parquet')
+    parser.add_argument('--base_day_dict', default=None,
+                        help='已有的 day_dict.pt 路径；生成后会与该字典合并（用于追加 2024-2025 数据）')
     args = parser.parse_args()
 
     os.makedirs(args.output_dir, exist_ok=True)
@@ -247,7 +249,17 @@ def main():
         day_num_cols=None,
     )
 
-    # 7. 保存
+    # 7. 与已有 day_dict 合并（如果提供）
+    if args.base_day_dict and os.path.exists(args.base_day_dict):
+        print(f"\n🔄 合并已有 day_dict: {args.base_day_dict}")
+        base_day_dict = torch.load(args.base_day_dict, weights_only=False)
+        n_before = len(day_dict)
+        day_dict.update(base_day_dict)
+        print(f"   合并后: {n_before} -> {len(day_dict)} 个 (sector, date) 条目")
+        del base_day_dict
+        gc.collect()
+
+    # 8. 保存
     day_dict_path = os.path.join(args.output_dir, 'day_dict.pt')
     config_path = os.path.join(args.output_dir, 'config.pt')
     torch.save(day_dict, day_dict_path)
