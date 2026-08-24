@@ -1,227 +1,261 @@
+"""
+从候选 Reddit CSV 生成 HAN 训练所需的 day_dict.pt + config.pt。
+
+作用:
+    读取 submissions/comments 候选 CSV（已由 filter_candidate_posts.py 预筛选），
+    经过 FlashText + GLiNER 匹配 ticker → FinBERT embedding → sector 级聚合，
+    最终输出 day_dict.pt 和 config.pt。
+
+用法:
+    python data_processing/scripts/pipeline.py \
+        --candidate_csvs \
+            /Volumes/T9/.../submissions_2021_2023_candidates.csv,\
+            /Volumes/T9/.../comments_2021_2023_candidates.csv,\
+            /Volumes/T9/.../submissions_2024_2025_candidates.csv,\
+            /Volumes/T9/.../comments_2024_2025_candidates.csv \
+        --stocks /Volumes/T9/.../stocks_2020_2026.csv \
+        --output_dir /Volumes/T9/.../data_processing \
+        --finbert_model ./finbert_model \
+        --gliner_model ./gliner_model
+
+输出:
+    {output_dir}/day_dict.pt
+    {output_dir}/config.pt
+    {output_dir}/matched_all.parquet   (可选，保留匹配结果供复用)
+    {output_dir}/embedding_output/     (parquet 分块 embedding)
+"""
+import argparse
+import gc
 import os
+import shutil
+import sys
+from pathlib import Path
+
 import numpy as np
-from dataset_utils import HandlersDataset
-from focal_loss import FocalLoss
+import pandas as pd
 import torch
-import torch.nn as nn
-from torch.utils.data import DataLoader, WeightedRandomSampler
-from torch.optim.lr_scheduler import ReduceLROnPlateau
-import seaborn as sns
-import matplotlib.pyplot as plt
-from sklearn.metrics import confusion_matrix, classification_report
-import seaborn as sns
-import matplotlib.pyplot as plt
-import importlib
-from model import HAN_Classification
-from train import ClassificationTrainer
-from data_processing.scripts.helpers import convert_to_binary_classification
-import config as project_config
+from tqdm import tqdm
 
-#loading data
-# 数据统一放在 config.py 指定的 data_dir（默认外部磁盘 T9）
-load_dir = project_config.args.data_dir
-# 用法: HAN_SAMPLE_DIR=<data_dir> python run.py（默认取 config.data_dir）
-sample_dir = os.environ.get("HAN_SAMPLE_DIR", load_dir)
-run_tag = os.environ.get("HAN_RUN_TAG", "default")
-print(f"   ...samples from {sample_dir} (run tag: {run_tag})")
+PROJECT_ROOT = Path(__file__).resolve().parents[2]
+sys.path.insert(0, str(PROJECT_ROOT))
+sys.path.insert(0, str(Path(__file__).resolve().parent))
 
-if os.path.exists(os.path.join(sample_dir, "config.pt")):
-    config = torch.load(os.path.join(sample_dir, "config.pt"), weights_only=False)
-    E = config['E']
-    D = config['D']
-    L = config['L']
-    print(f"   ...config: E={E}, D={D}, L={L}")
-else:
-    print("can't find config.pt")
-
-day_dict_path = os.environ.get("HAN_DAY_DICT", os.path.join(load_dir, "day_dict.pt"))
-print(f"   ...day_dict: {day_dict_path}")
-day_dict = torch.load(day_dict_path, weights_only=False)
-
-train_s = torch.load(os.path.join(sample_dir, "train_samples.pt"), weights_only=False)
-val_s   = torch.load(os.path.join(sample_dir, "val_samples.pt"), weights_only=False)
-test_s  = torch.load(os.path.join(sample_dir, "test_samples.pt"), weights_only=False)
-
-print(f"   ...sample loaded: train ({len(train_s)}), validation ({len(val_s)}), test ({len(test_s)})")
-
-# pipeline 产出的样本标签已是 0/1 二分类，阈值 0.5 保持原样
-THRESHOLD_RISK = 0.5
-train_s_cls = convert_to_binary_classification(train_s, THRESHOLD_RISK)
-val_s_cls   = convert_to_binary_classification(val_s, THRESHOLD_RISK)
-test_s_cls  = convert_to_binary_classification(test_s, THRESHOLD_RISK)
-
-# day features（day_dict 里存的是 log1p(当日帖子数)）默认关闭，只用文本 embedding。
-# 设 HAN_USE_DAY_FEAT=1 打开，用 config.pt 里记录的维度 D。
-use_day_feat = os.environ.get("HAN_USE_DAY_FEAT", "0") == "1"
-# D 直接从 day_dict 实际内容推断，避免 config.pt 与打过补丁的 day_dict 不一致
-D = int(next(iter(day_dict.values()))["day_features"].numel()) if use_day_feat else 0
-L = 50
-print(f"   ...day features: {'ON' if use_day_feat else 'OFF'} (D={D})")
-train_ds = HandlersDataset(train_s_cls, day_dict, L=L, E=E, D=D)
-val_ds   = HandlersDataset(val_s_cls,   day_dict, L=L, E=E, D=D)
-test_ds  = HandlersDataset(test_s_cls,  day_dict, L=L, E=E, D=D)
-
-train_labels = []
-for idx in range(len(train_ds)):
-    sample = train_ds[idx]
-    train_labels.append(sample['y'].item())  #
-train_labels = np.array(train_labels)
-
-class_sample_count = np.array([
-    len(np.where(train_labels == 0)[0]),  
-    len(np.where(train_labels == 1)[0])   
-])
-
-class_sample_count = np.maximum(class_sample_count, 1)
-weight = 1. / class_sample_count  
-samples_weight = np.array([weight[t] for t in train_labels])
-samples_weight = torch.from_numpy(samples_weight).float() 
-
-sampler = WeightedRandomSampler(
-    weights=samples_weight,
-    num_samples=len(samples_weight),
-    replacement=True
-)
-
-train_loader = DataLoader(
-    train_ds,
-    batch_size=64,
-    sampler=sampler,
-    num_workers=0,    # Mac 上避免多进程 dataloader 问题
-    pin_memory=True,
-    drop_last=True
-)
-
-val_loader = DataLoader(
-    val_ds,
-    batch_size=64,
-    shuffle=False,
-    num_workers=0,
-    pin_memory=True
-)
-
-test_loader = DataLoader(
-    test_ds,
-    batch_size=64,
-    shuffle=False,
-    num_workers=0,
-    pin_memory=True
+from helpers import (
+    batch_process_embeddings_stream,
+    build_day_dict_compact,
+    count_floats,
+    count_keywords,
+    perform_local_extraction,
 )
 
 
-#training
-Num_epoches = 20 #change
-if torch.cuda.is_available():
-    device = torch.device('cuda')
-elif torch.backends.mps.is_available():
-    device = torch.device('mps')
-else:
-    device = torch.device('cpu')
-# 标签语义：1 = 未来 5 日 CAPM 异质波动率高于全期中位数（HighIVOL），0 = 偏低（LowIVOL）
-# pipeline.py 已按中位数把 ivol_5 二分类，样本标签为 0/1，阈值 0.5 保持原样
-# 类别平衡已由上面的 WeightedRandomSampler 处理，loss 不再叠加类权重
-# （之前 [1.0, 1.4] 在 60% 正类的训练集上进一步推高正类，导致模型全猜一类）
-criterion = torch.nn.CrossEntropyLoss()
+def load_stocks(path):
+    """加载股票面板，返回 ticker -> sector 映射和公司名映射。"""
+    df = pd.read_csv(path)
+    df = df.dropna(subset=['ticker', 'sector'])
+    df['ticker'] = df['ticker'].astype(str).str.upper()
+    df['name'] = df['name'].astype(str).str.strip()
+    ticker_to_sector = dict(zip(df['ticker'], df['sector']))
+    # name -> ticker: 用第一个非空名字
+    names = {}
+    for _, row in df.iterrows():
+        name = str(row['name']).strip()
+        if name and name.upper() != 'NAN':
+            names[name.upper()] = row['ticker']
+    return ticker_to_sector, names, sorted(df['ticker'].unique())
 
-model = HAN_Classification(
-    embedding_dim=E, 
-    gru_hidden_dim=64,        
-    gru_num_layers=1,
-    prediction_hidden_dim=32,
-    num_classes=2,
-    dropout=0.4,
-    day_feature_dim=D
-)
-model.to(device)
 
-optimizer = torch.optim.AdamW(model.parameters(), lr=5e-4, weight_decay=1e-4)
-scheduler = ReduceLROnPlateau(
-    optimizer,
-    mode='min',
-    factor=0.5,
-    patience=2,
-    min_lr=1e-6
-)
+def read_candidates_in_chunks(paths, chunksize=200_000):
+    """逐个文件、逐块读取候选 CSV，yield DataFrame chunks。"""
+    for p in paths:
+        print(f"\n📂 读取候选文件: {p}")
+        for chunk in pd.read_csv(p, chunksize=chunksize):
+            yield chunk
 
-save_dir = f"./checkpoints/{run_tag}"
 
-trainer = ClassificationTrainer(
-    model=model,
-    train_loader=train_loader,
-    val_loader=val_loader,
-    optimizer=optimizer,
-    scheduler=scheduler,
-    criterion=criterion,
-    device=device,
-    save_path=save_dir
-)
+def load_gliner(gliner_model_path):
+    """预加载 GLiNER 模型，避免每个 chunk 重复加载。"""
+    from gliner import GLiNER
+    from helpers import get_device
+    if not os.path.exists(gliner_model_path):
+        gliner_model_path = "urchade/gliner_small-v2.1"
+    device = get_device()
+    print(f"Loading GLiNER from {gliner_model_path} on {device} ...")
+    model = GLiNER.from_pretrained(gliner_model_path).to(device)
+    model.eval()
+    return model
 
-trainer.train(num_epochs=Num_epoches, patience=5)
 
-#testing performance on test set
-model_path = os.path.join(save_dir, "best_model.pt")
-try:
-    model.load_state_dict(torch.load(model_path, map_location=device))
-    print(f"✅ Successfully loaded best model from {model_path}")
-except Exception as e:
-    print(f"❌ Load model failed: {e}")
-    exit()
+def process_chunk(chunk, valid_tickers, names, gliner_model, temp_file):
+    """对一块候选数据做 ticker 匹配，返回匹配到的 DataFrame（保留 date, score）。"""
+    # 确保列存在
+    for col in ['id', 'title', 'selftext', 'body', 'date', 'score']:
+        if col not in chunk.columns:
+            chunk[col] = None
 
-model.eval() 
-all_preds = []
-all_labels = []
-total_loss = 0.0
+    # 合并文本
+    chunk['combined_text'] = (
+        chunk['title'].fillna('') + ' ' +
+        chunk['selftext'].fillna('') + ' ' +
+        chunk['body'].fillna('')
+    ).str.strip()
 
-criterion = torch.nn.CrossEntropyLoss()
+    # 空文本直接跳过
+    chunk = chunk[chunk['combined_text'].str.len() > 0].copy()
+    if len(chunk) == 0:
+        return pd.DataFrame()
 
-with torch.no_grad():  
-    for batch in test_loader:
-        x_text = batch['x_text'].to(device)
-        x_mask = batch['x_mask'].to(device)
-        x_day = batch['x_day_feat'].to(device) if 'x_day_feat' in batch else None
-        y = batch['y'].to(device).long()
+    matched = perform_local_extraction(
+        chunk,
+        temp_file,
+        valid_tickers=valid_tickers,
+        names=names,
+        black_list=set(),  # 如需黑名单可后续补充
+        gliner_model_path="./gliner_model",  # 仅当 model 为 None 时备用
+        model=gliner_model,
+    )
 
-        logits, _, _ = model(x_text, x_mask, x_day)
-        
-        loss = criterion(logits, y)
-        total_loss += loss.item()
-        
-        preds = torch.argmax(logits, dim=1) 
-        
-        all_preds.extend(preds.cpu().numpy())
-        all_labels.extend(y.cpu().numpy())
+    if len(matched) == 0:
+        return pd.DataFrame()
 
-all_preds = np.array(all_preds)
-all_labels = np.array(all_labels)
+    # 把 date 和 score 从原始 chunk 合并回来
+    keep_cols = ['id', 'date', 'score']
+    matched = matched.merge(chunk[keep_cols], on='id', how='left')
+    return matched
 
-cm = confusion_matrix(all_labels, all_preds)
-report = classification_report(
-    all_labels,
-    all_preds,
-    target_names=['LowIVOL (0)', 'HighIVOL (1)'],
-    digits=4
-)
 
-tn, fp, fn, tp = cm.ravel()
-out_prec = tp / (tp + fp) if (tp + fp) > 0 else 0.0
-out_recall = tp / (tp + fn) if (tp + fn) > 0 else 0.0
-out_f1 = 2 * (out_prec * out_recall) / (out_prec + out_recall) if (out_prec + out_recall) > 0 else 0.0
-acc = (tp + tn) / (tp + tn + fp + fn)
-avg_loss = total_loss / len(test_loader)
+def main():
+    parser = argparse.ArgumentParser(description="Reddit 候选 → HAN day_dict 数据管道")
+    parser.add_argument('--candidate_csvs', required=True,
+                        help='逗号分隔的候选 CSV 路径（submissions + comments）')
+    parser.add_argument('--stocks', required=True,
+                        help='股票面板 CSV，含 ticker, name, sector 列')
+    parser.add_argument('--output_dir', required=True,
+                        help='输出目录（存 day_dict.pt, config.pt 等）')
+    parser.add_argument('--finbert_model', default='./finbert_model',
+                        help='本地 FinBERT 模型目录')
+    parser.add_argument('--gliner_model', default='./gliner_model',
+                        help='本地 GLiNER 模型目录')
+    parser.add_argument('--chunksize', type=int, default=200_000,
+                        help='读取 CSV 的块大小')
+    parser.add_argument('--L', type=int, default=50,
+                        help='每天每个 sector 保留的最大帖子数')
+    parser.add_argument('--save_matched', action='store_true',
+                        help='是否保存匹配后的中间表 matched_all.parquet')
+    args = parser.parse_args()
 
-print("\n" + "="*50)
-print("📊 Test Set Results")
-print("="*50)
-print(f"Average Loss: {avg_loss:.4f}")
-print(f"Overall Accuracy: {acc:.4%}")
-print(f"HighIVOL Precision: {out_prec:.4f}")
-print(f"HighIVOL Recall: {out_recall:.4f}")
-print(f"HighIVOL F1-Score: {out_f1:.4f}")
+    os.makedirs(args.output_dir, exist_ok=True)
+    temp_file = os.path.join(args.output_dir, 'temp_matched.csv')
+    embedding_dir = os.path.join(args.output_dir, 'embedding_output')
 
-print("\n🔍 Confusion Matrix:")
-print(f"           Pred_Low    Pred_High")
-print(f"Actual_0:     {tn:<10} {fp:<8}")
-print(f"Actual_1:     {fn:<10} {tp:<8}")
+    # 1. 加载股票面板
+    print(f"📊 加载股票面板: {args.stocks}")
+    ticker_to_sector, names, valid_tickers = load_stocks(args.stocks)
+    print(f"   tickers: {len(valid_tickers)}, sectors: {len(set(ticker_to_sector.values()))}")
 
-print("\n📋 Detailed Classification Report:")
-print(report)
+    # 2. 预加载 GLiNER（只加载一次）
+    gliner_model = load_gliner(args.gliner_model)
+
+    # 3. 分块匹配
+    candidate_paths = [p.strip() for p in args.candidate_csvs.split(',')]
+    all_matched_parts = []
+    part_idx = 0
+
+    for chunk in read_candidates_in_chunks(candidate_paths, chunksize=args.chunksize):
+        print(f"\n🔍 处理 chunk {part_idx}, 行数 {len(chunk)}")
+        matched = process_chunk(chunk, valid_tickers, names, gliner_model, temp_file)
+        print(f"   匹配到 {len(matched)} 行")
+
+        if len(matched) > 0:
+            # 保存当前块，避免内存累积
+            part_path = os.path.join(args.output_dir, f'matched_part_{part_idx:04d}.parquet')
+            matched.to_parquet(part_path, index=False)
+            all_matched_parts.append(part_path)
+            del matched
+
+        del chunk
+        gc.collect()
+        part_idx += 1
+
+    if not all_matched_parts:
+        print("❌ 没有匹配到任何帖子，退出")
+        return
+
+    # 3. 合并匹配结果并映射到 sector
+    print(f"\n🧩 合并 {len(all_matched_parts)} 个匹配分块...")
+    matched_dfs = [pd.read_parquet(p) for p in all_matched_parts]
+    df_matched = pd.concat(matched_dfs, ignore_index=True)
+    for p in all_matched_parts:
+        os.remove(p)
+    del matched_dfs
+    gc.collect()
+
+    # ticker -> sector
+    df_matched['ticker'] = df_matched['matched_ticker'].str.upper()
+    df_matched['sector'] = df_matched['ticker'].map(ticker_to_sector)
+    df_matched = df_matched.dropna(subset=['sector'])
+    print(f"   映射到 sector 后: {len(df_matched)} 行, {df_matched['sector'].nunique()} 个 sector")
+
+    # 日期标准化
+    df_matched['date'] = pd.to_datetime(df_matched['date'], errors='coerce')
+    df_matched = df_matched.dropna(subset=['date'])
+    print(f"   有效日期后: {len(df_matched)} 行")
+
+    # 文本特征
+    df_matched['float_count'] = df_matched['source_text'].apply(count_floats)
+    df_matched['keyword_count'] = df_matched['source_text'].apply(count_keywords)
+    df_matched['word_count'] = df_matched['source_text'].fillna('').apply(lambda x: len(str(x).split()))
+
+    if args.save_matched:
+        matched_path = os.path.join(args.output_dir, 'matched_all.parquet')
+        df_matched.to_parquet(matched_path, index=False)
+        print(f"   已保存: {matched_path}")
+
+    # 4. FinBERT embedding
+    print(f"\n🤖 生成 FinBERT embedding...")
+    batch_process_embeddings_stream(
+        df_matched,
+        text_col='source_text',
+        output_dir=embedding_dir,
+        chunk_size=5000,
+        batch_size=256,
+        max_length=512,
+        model_path=args.finbert_model,
+    )
+
+    # 5. 合并 embedding
+    print(f"\n🔗 合并 embedding...")
+    emb_files = sorted([f for f in os.listdir(embedding_dir) if f.endswith('.parquet')])
+    emb_dfs = [pd.read_parquet(os.path.join(embedding_dir, f)) for f in emb_files]
+    df_emb = pd.concat(emb_dfs, ignore_index=True)
+    df_matched = df_matched.reset_index(drop=True)
+    df_matched['original_index'] = df_matched.index
+    final_df = pd.merge(df_matched, df_emb, on='original_index', how='inner')
+    print(f"   合并后: {len(final_df)} 行")
+    del df_emb, df_matched
+    gc.collect()
+
+    # 6. 构建 day_dict (sector 级)
+    print(f"\n📅 构建 day_dict (L={args.L})...")
+    day_dict, E, D = build_day_dict_compact(
+        final_df,
+        L=args.L,
+        embedding_col='embedding',
+        ticker_col='sector',
+        date_col='date',
+        sort_cols=['keyword_count', 'word_count', 'score'],
+        day_num_cols=None,
+    )
+
+    # 7. 保存
+    day_dict_path = os.path.join(args.output_dir, 'day_dict.pt')
+    config_path = os.path.join(args.output_dir, 'config.pt')
+    torch.save(day_dict, day_dict_path)
+    torch.save({'E': E, 'D': D, 'L': args.L}, config_path)
+    print(f"\n✅ 完成")
+    print(f"   day_dict: {day_dict_path} ({len(day_dict)} 个 (sector, date) 条目)")
+    print(f"   config: {config_path} (E={E}, D={D}, L={args.L})")
+
+
+if __name__ == '__main__':
+    main()
