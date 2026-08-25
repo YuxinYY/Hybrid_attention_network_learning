@@ -16,17 +16,26 @@
         --stocks /Volumes/T9/.../stocks_2020_2026.csv \
         --output_dir /Volumes/T9/.../data_processing \
         --finbert_model ./finbert_model \
-        --gliner_model ./gliner_model
+        --gliner_model ./gliner_model \
+        --resume
 
 输出:
     {output_dir}/day_dict.pt
     {output_dir}/config.pt
     {output_dir}/matched_all.parquet   (可选，保留匹配结果供复用)
     {output_dir}/embedding_output/     (parquet 分块 embedding)
+    {output_dir}/matched_part_*.parquet (中间匹配结果，resume 用)
+
+断点续跑 (resume):
+    如果 --resume 被指定，脚本会扫描 output_dir 下已有的 matched_part_{idx:04d}.parquet，
+    跳过已处理的 chunk，从下一个 chunk 继续。注意：chunk 序号与 part 序号一一对应，
+    因此要求之前的运行没有手工删改中间文件。
 """
 import argparse
 import gc
+import itertools
 import os
+import re
 import shutil
 import sys
 from pathlib import Path
@@ -47,6 +56,23 @@ from helpers import (
     count_keywords,
     perform_local_extraction,
 )
+
+
+def get_resume_state(output_dir):
+    """
+    扫描已有的 matched_part 文件，返回下一个 part_idx 和需要跳过的 chunk 数量。
+    假设 part 序号与 chunk 序号一一对应（每个 chunk 都会写 part 文件）。
+    """
+    pattern = re.compile(r'matched_part_(\d{4})\.parquet$')
+    existing = []
+    for f in os.listdir(output_dir):
+        m = pattern.match(f)
+        if m:
+            existing.append(int(m.group(1)))
+    if not existing:
+        return 0, 0
+    max_idx = max(existing)
+    return max_idx + 1, max_idx + 1
 
 
 def load_stocks(path):
@@ -103,7 +129,7 @@ def process_chunk(chunk, valid_tickers, names, gliner_model, temp_file):
     # 空文本直接跳过
     chunk = chunk[chunk['combined_text'].str.len() > 0].copy()
     if len(chunk) == 0:
-        return pd.DataFrame()
+        return _empty_matched()
 
     matched = perform_local_extraction(
         chunk,
@@ -116,12 +142,17 @@ def process_chunk(chunk, valid_tickers, names, gliner_model, temp_file):
     )
 
     if len(matched) == 0:
-        return pd.DataFrame()
+        return _empty_matched()
 
     # 把 date 和 score 从原始 chunk 合并回来
     keep_cols = ['id', 'date', 'score']
     matched = matched.merge(chunk[keep_cols], on='id', how='left')
     return matched
+
+
+def _empty_matched():
+    """返回空的 matched DataFrame（保持列结构一致，便于 resume 时 concat）。"""
+    return pd.DataFrame(columns=['id', 'source_text', 'matched_ticker', 'date', 'score'])
 
 
 def main():
@@ -144,11 +175,19 @@ def main():
                         help='是否保存匹配后的中间表 matched_all.parquet')
     parser.add_argument('--base_day_dict', default=None,
                         help='已有的 day_dict.pt 路径；生成后会与该字典合并（用于追加 2024-2025 数据）')
+    parser.add_argument('--resume', action='store_true',
+                        help='断点续跑：跳过 output_dir 中已存在的 matched_part_*.parquet')
     args = parser.parse_args()
 
     os.makedirs(args.output_dir, exist_ok=True)
     temp_file = os.path.join(args.output_dir, 'temp_matched.csv')
     embedding_dir = os.path.join(args.output_dir, 'embedding_output')
+
+    # 断点续跑状态
+    part_idx, skip_chunks = 0, 0
+    if args.resume:
+        part_idx, skip_chunks = get_resume_state(args.output_dir)
+        print(f"🔄 resume: 已找到 part 0-{part_idx-1:04d}，跳过前 {skip_chunks} 个 chunk，从 part {part_idx:04d} 开始")
 
     # 1. 加载股票面板
     print(f"📊 加载股票面板: {args.stocks}")
@@ -160,20 +199,26 @@ def main():
 
     # 3. 分块匹配
     candidate_paths = [p.strip() for p in args.candidate_csvs.split(',')]
-    all_matched_parts = []
-    part_idx = 0
+    all_matched_parts = sorted([
+        os.path.join(args.output_dir, f)
+        for f in os.listdir(args.output_dir)
+        if re.match(r'matched_part_\d{4}\.parquet$', f)
+    ])
 
-    for chunk in read_candidates_in_chunks(candidate_paths, chunksize=args.chunksize):
+    chunk_iter = read_candidates_in_chunks(candidate_paths, chunksize=args.chunksize)
+    if skip_chunks > 0:
+        chunk_iter = itertools.islice(chunk_iter, skip_chunks, None)
+
+    for chunk in chunk_iter:
         print(f"\n🔍 处理 chunk {part_idx}, 行数 {len(chunk)}")
         matched = process_chunk(chunk, valid_tickers, names, gliner_model, temp_file)
         print(f"   匹配到 {len(matched)} 行")
 
-        if len(matched) > 0:
-            # 保存当前块，避免内存累积
-            part_path = os.path.join(args.output_dir, f'matched_part_{part_idx:04d}.parquet')
-            matched.to_parquet(part_path, index=False)
-            all_matched_parts.append(part_path)
-            del matched
+        # 每个 chunk 都写 part 文件，保证 chunk_idx == part_idx，便于 resume
+        part_path = os.path.join(args.output_dir, f'matched_part_{part_idx:04d}.parquet')
+        matched.to_parquet(part_path, index=False)
+        all_matched_parts.append(part_path)
+        del matched
 
         del chunk
         gc.collect()
