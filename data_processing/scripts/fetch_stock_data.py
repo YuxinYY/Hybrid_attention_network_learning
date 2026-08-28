@@ -129,8 +129,10 @@ def main():
                         help='只抓取 S&P 500 指数，跳过个股 universe')
     args = parser.parse_args()
 
-    # 指数多抓一个月尾部，保证 2023 年末的样本也能计算未来 20 日收益
-    fetch_sp500(args.start, '2024-02-01', args.index_output)
+    # 指数多抓一个月尾部，保证年末样本也能计算未来 N 日收益
+    from datetime import datetime, timedelta
+    index_end = (datetime.strptime(args.end, '%Y-%m-%d') + timedelta(days=30)).strftime('%Y-%m-%d')
+    fetch_sp500(args.start, index_end, args.index_output)
     if args.index_only:
         return
 
