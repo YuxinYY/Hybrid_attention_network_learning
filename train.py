@@ -114,7 +114,8 @@ class ClassificationTrainer:
         # 早停初始化
         best_val_loss = float('inf')  # 监控验证集Loss（核心）
         stop_count = 0                # 连续不提升的epoch数
-        best_risk_f1 = 0.0            # 保留最佳Risk F1
+        best_risk_f1 = -1.0           # Save the first epoch even when F1 is zero.
+        self.best_epoch = None
         
         for epoch in range(num_epochs):
             train_loss = self.train_epoch()
@@ -145,6 +146,7 @@ class ClassificationTrainer:
             # 保存最佳模型（基于Risk F1）
             if risk_f1 > best_risk_f1:
                 best_risk_f1 = risk_f1
+                self.best_epoch = epoch + 1
                 torch.save(self.model.state_dict(), self.save_path / "best_model.pt")
                 print(f"New Best Risk F1 Saved! (Current Best: {best_risk_f1:.4f})")
             

@@ -1,210 +1,125 @@
-import os
+"""Train/evaluate HAN with daily top-20% labels and save a reproducible experiment."""
+import argparse
+from datetime import datetime, timezone
+import hashlib
+import json
+from pathlib import Path
+import random
+
 import numpy as np
-from dataset_utils import HandlersDataset
-from focal_loss import FocalLoss
+import pandas as pd
 import torch
-import torch.nn as nn
 from torch.utils.data import DataLoader, WeightedRandomSampler
-from torch.optim.lr_scheduler import ReduceLROnPlateau
-import seaborn as sns
-import matplotlib.pyplot as plt
-from sklearn.metrics import confusion_matrix, classification_report
-import seaborn as sns
-import matplotlib.pyplot as plt
-import importlib
-import vol_model, vol_train
-from vol_model import HAN_Classification
-from vol_train import ClassificationTrainer
-from data_processing.scripts.helpers import convert_to_binary_classification
 
-#loading data
-load_dir = "./data_processing"
-
-if os.path.exists(os.path.join(load_dir, "config.pt")):
-    config = torch.load(os.path.join(load_dir, "config.pt"))
-    E = config['E']
-    D = config['D']
-    L = config['L']
-    print(f"   ...config: E={E}, D={D}, L={L}")
-else:
-    print("can't find config.pt")
-
-day_dict = torch.load(os.path.join(load_dir, "day_dict.pt"))
-
-train_s = torch.load(os.path.join(load_dir, "train_samples.pt"))
-val_s   = torch.load(os.path.join(load_dir, "val_samples.pt"))
-test_s  = torch.load(os.path.join(load_dir, "test_samples.pt"))
-
-print(f"   ...sample loaded: train ({len(train_s)}), validation ({len(val_s)}), test ({len(test_s)})")
-
-train_ds = HandlersDataset(train_s, day_dict, L=50, E=E, D=D)
-val_ds   = HandlersDataset(val_s,   day_dict, L=50, E=E, D=D)
-test_ds  = HandlersDataset(test_s,  day_dict, L=50, E=E, D=D)
-
-THRESHOLD_RISK = -100 #the threshold is up to you
-train_s_cls = convert_to_binary_classification(train_s, THRESHOLD_RISK)
-val_s_cls   = convert_to_binary_classification(val_s, THRESHOLD_RISK)
-test_s_cls  = convert_to_binary_classification(test_s, THRESHOLD_RISK)
-
-E = 772  # 768 + 4
-L = 50  
-train_ds = HandlersDataset(train_s_cls, day_dict, L=L, E=E, D=0)
-val_ds   = HandlersDataset(val_s_cls,   day_dict, L=L, E=E, D=0)
-test_ds  = HandlersDataset(test_s_cls,  day_dict, L=L, E=E, D=0)
-
-train_labels = []
-for idx in range(len(train_ds)):
-    sample = train_ds[idx]
-    train_labels.append(sample['y'].item())  #
-train_labels = np.array(train_labels)
-
-class_sample_count = np.array([
-    len(np.where(train_labels == 0)[0]),  
-    len(np.where(train_labels == 1)[0])   
-])
-
-class_sample_count = np.maximum(class_sample_count, 1)
-weight = 1. / class_sample_count  
-samples_weight = np.array([weight[t] for t in train_labels])
-samples_weight = torch.from_numpy(samples_weight).float() 
-
-sampler = WeightedRandomSampler(
-    weights=samples_weight,
-    num_samples=len(samples_weight),
-    replacement=True
+from data_processing.scripts.labels import (
+    LABEL_SCHEME, compute_future_realized_vol, daily_top_fraction_labels, relabel_samples,
 )
-
-train_loader = DataLoader(
-    train_ds,
-    batch_size=64,
-    sampler=sampler,  
-    num_workers=8,    
-    pin_memory=True,  
-    drop_last=True    
-)
-
-val_loader = DataLoader(
-    val_ds,
-    batch_size=64,
-    shuffle=False,
-    num_workers=8,
-    pin_memory=True
-)
-
-test_loader = DataLoader(
-    test_ds,
-    batch_size=64,
-    shuffle=False,
-    num_workers=8,
-    pin_memory=True
-)
+from dataset_utils import HandlersDataset
+from model import HAN_Classification
+from train import ClassificationTrainer
+from evaluation import predict_neural, save_evaluation
 
 
-#training
-Num_epoches = 10 #change
-device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-cls_weights = torch.tensor([1.0, 1.4]).to(device)  #change the weights to your preference
-criterion = torch.nn.CrossEntropyLoss(weight=torch.tensor([1.0, 1.4]).to(device))
-# criterion = FocalLoss(alpha=0.25, gamma=1.5, weight=cls_weights)
+def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument('--data-dir', type=Path, default=Path('data_processing'))
+    parser.add_argument('--stocks', type=Path, default=Path('stocks.csv'))
+    parser.add_argument('--output-dir', type=Path)
+    parser.add_argument('--epochs', type=int, default=10)
+    parser.add_argument('--seed', type=int, default=42)
+    parser.add_argument('--threads', type=int, default=4)
+    parser.add_argument('--compare-baselines', action='store_true',
+                        help='Also train/evaluate CNN, logistic regression, and temporal Transformer')
+    args = parser.parse_args()
+    random.seed(args.seed)
+    np.random.seed(args.seed)
+    torch.manual_seed(args.seed)
+    torch.set_num_threads(args.threads)
+    output = args.output_dir or Path('experiments') / (
+        'daily_top20_' + datetime.now(timezone.utc).strftime('%Y%m%dT%H%M%S%fZ')
+    )
+    output.mkdir(parents=True, exist_ok=False)
+    config = torch.load(args.data_dir / 'config.pt', weights_only=False)
+    day_dict = torch.load(args.data_dir / 'day_dict.pt', weights_only=False)
+    labels = daily_top_fraction_labels(compute_future_realized_vol(pd.read_csv(args.stocks)))
+    labels.to_csv(output / 'daily_labels.csv', index=False)
+    splits, counts, sources = {}, {}, {}
+    boundaries = {'train': config.get('val_start', '2023-08-01'),
+                  'val': config.get('test_start', '2023-11-01'), 'test': None}
+    # Always regenerate targets from returns; old median labels are never reused.
+    for name, boundary in boundaries.items():
+        source = args.data_dir / f'{name}_samples.pt'
+        original = torch.load(source, weights_only=False)
+        samples = relabel_samples(original, labels, boundary)
+        if not samples:
+            raise ValueError(f'No usable {name} samples after relabeling')
+        splits[name] = samples
+        torch.save(samples, output / f'{name}_samples.pt')
+        positives = sum(s[3] for s in samples)
+        counts[name] = dict(samples=len(samples), positive=positives,
+                            negative=len(samples)-positives,
+                            positive_rate=positives/len(samples),
+                            dropped=len(original)-len(samples),
+                            first_date=str(min(s[1] for s in samples)),
+                            last_date=str(max(s[1] for s in samples)))
+        sources[str(source)] = hashlib.sha256(source.read_bytes()).hexdigest()
+        print(name, counts[name], flush=True)
+    for source in [args.stocks, args.data_dir / 'day_dict.pt', args.data_dir / 'config.pt',
+                   Path(__file__), Path('train.py'), Path('model.py'), Path('dataset_utils.py'),
+                   Path('data_processing/scripts/labels.py'), Path('evaluation.py'),
+                   Path('baseline_models.py'), Path('baseline_comparison.py')]:
+        sources[str(source)] = hashlib.sha256(source.read_bytes()).hexdigest()
+    device = torch.device('cuda' if torch.cuda.is_available() else
+                          'mps' if torch.backends.mps.is_available() else 'cpu')
+    datasets = {name: HandlersDataset(s, day_dict, L=50, E=config['E'], D=0)
+                for name, s in splits.items()}
+    targets = np.array([s[3] for s in splits['train']])
+    class_counts = np.bincount(targets, minlength=2)
+    if (class_counts == 0).any():
+        raise ValueError('Training split must contain both classes')
+    sampler = WeightedRandomSampler(torch.tensor(1.0/class_counts[targets]),
+                                    len(targets), replacement=True)
+    loaders = {name: DataLoader(ds, batch_size=64, num_workers=0,
+                                pin_memory=device.type == 'cuda',
+                                sampler=sampler if name == 'train' else None,
+                                drop_last=name == 'train' and len(ds) >= 64)
+               for name, ds in datasets.items()}
+    model = HAN_Classification(embedding_dim=config['E'], gru_hidden_dim=64,
+                               gru_num_layers=1, prediction_hidden_dim=32,
+                               num_classes=2, dropout=0.4).to(device)
+    criterion = torch.nn.CrossEntropyLoss(weight=torch.tensor([1., 1.4], device=device))
+    optimizer = torch.optim.AdamW(model.parameters(), lr=5e-5, weight_decay=1e-4)
+    scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
+        optimizer, mode='min', factor=0.5, patience=2, min_lr=1e-6)
+    metadata = dict(label_scheme=LABEL_SCHEME, positive_fraction=0.2,
+                    ranking_universe='All stocks with complete forward returns in stocks CSV',
+                    universe_tickers=sorted(labels.ticker.unique().tolist()),
+                    tie_break='ticker ascending', positive_count='ceil(0.2 * daily N)',
+                    seed=args.seed, device=str(device), epochs_requested=args.epochs,
+                    learning_rate=5e-5, batch_size=64, weight_decay=1e-4,
+                    dropout=0.4, class_weights=[1., 1.4], sampler='inverse frequency',
+                    split_counts=counts, purge_boundaries=boundaries, source_sha256=sources,
+                    text_source='Reused saved day_dict and sample lookback windows',
+                    decision_rule='argmax logits (positive probability > 0.5)',
+                    checkpoint_selection='maximum validation Risk F1',
+                    compare_baselines=args.compare_baselines)
+    (output / 'config.json').write_text(json.dumps(metadata, indent=2))
+    trainer = ClassificationTrainer(model, loaders['train'], loaders['val'], optimizer,
+                                    scheduler, criterion, device, output)
+    trainer.train(num_epochs=args.epochs, patience=5)
+    (output / 'history.json').write_text(json.dumps(trainer.history, indent=2))
+    model.load_state_dict(torch.load(output / 'best_model.pt', map_location=device, weights_only=True))
+    metrics, probabilities = predict_neural(model, loaders['test'], device)
+    metrics.update(best_epoch=trainer.best_epoch, epochs_completed=len(trainer.history['train_loss']))
+    (output / 'metrics.json').write_text(json.dumps(metrics, indent=2))
+    save_evaluation(output, splits['test'], probabilities, metrics)
+    print(json.dumps(metrics, indent=2), flush=True)
+    if args.compare_baselines:
+        from baseline_comparison import compare_baselines
+        compare_baselines(model, metrics, probabilities, datasets, splits, output,
+                          config['E'], args.seed, args.epochs, device)
+    print(f'Experiment saved to {output}', flush=True)
 
-model = HAN_Classification(
-    embedding_dim=E, 
-    gru_hidden_dim=64,        
-    gru_num_layers=1,
-    prediction_hidden_dim=32,
-    num_classes=2,            
-    dropout=0.4
-)
-model.to(device)
 
-optimizer = torch.optim.AdamW(model.parameters(), lr=5e-5, weight_decay=1e-4)
-scheduler = ReduceLROnPlateau(
-    optimizer, 
-    mode='min', 
-    factor=0.5, 
-    patience=2,              
-    verbose=True,
-    min_lr=1e-6
-)
-
-save_dir = "./checkpoints"
-
-trainer = ClassificationTrainer(
-    model=model,
-    train_loader=train_loader,
-    val_loader=val_loader,
-    optimizer=optimizer,
-    scheduler=scheduler,
-    criterion=criterion,
-    device=device,
-    save_path=save_dir
-)
-
-trainer.train(num_epochs=Num_epoches, patience=5)
-
-#testing performance on test set
-model_path = "./checkpoints/best_model.pt"  
-try:
-    model.load_state_dict(torch.load(model_path, map_location=device))
-    print(f"✅ Successfully loaded best model from {model_path}")
-except Exception as e:
-    print(f"❌ Load model failed: {e}")
-    exit()
-
-model.eval() 
-all_preds = []
-all_labels = []
-total_loss = 0.0
-
-criterion = torch.nn.CrossEntropyLoss(weight=torch.tensor([1.0, 1.4]).to(device))
-
-with torch.no_grad():  
-    for batch in test_loader:
-        x_text = batch['x_text'].to(device)
-        x_mask = batch['x_mask'].to(device)
-        y = batch['y'].to(device).long()
-        
-        logits, _, _ = model(x_text, x_mask)  
-        
-        loss = criterion(logits, y)
-        total_loss += loss.item()
-        
-        preds = torch.argmax(logits, dim=1) 
-        
-        all_preds.extend(preds.cpu().numpy())
-        all_labels.extend(y.cpu().numpy())
-
-all_preds = np.array(all_preds)
-all_labels = np.array(all_labels)
-
-cm = confusion_matrix(all_labels, all_preds)
-report = classification_report(
-    all_labels, 
-    all_preds, 
-    target_names=['Safe (0)', 'Risk (1)'],
-    digits=4 
-)
-
-tn, fp, fn, tp = cm.ravel()  
-risk_prec = tp / (tp + fp) if (tp + fp) > 0 else 0.0 
-risk_recall = tp / (tp + fn) if (tp + fn) > 0 else 0.0 
-risk_f1 = 2 * (risk_prec * risk_recall) / (risk_prec + risk_recall) if (risk_prec + risk_recall) > 0 else 0.0
-acc = (tp + tn) / (tp + tn + fp + fn) 
-avg_loss = total_loss / len(test_loader)
-
-print("\n" + "="*50)
-print("📊 Test Set Results")
-print("="*50)
-print(f"Average Loss: {avg_loss:.4f}")
-print(f"Overall Accuracy: {acc:.4%}")
-print(f"Risk Precision: {risk_prec:.4f}")
-print(f"Risk Recall: {risk_recall:.4f}")
-print(f"Risk F1-Score: {risk_f1:.4f}")
-
-print("\n🔍 Confusion Matrix:")
-print(f"           Pred_Safe  Pred_Risk")
-print(f"Actual_0:     {tn:<8} {fp:<8}")
-print(f"Actual_1:     {fn:<8} {tp:<8}")
-
-print("\n📋 Detailed Classification Report:")
-print(report)
+if __name__ == '__main__':
+    main()

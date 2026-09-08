@@ -82,6 +82,7 @@ data_processing/**
 *.parquet
 *.pkl
 *.pickle
+*.joblib
 *.npy
 *.npz
 *.h5
@@ -121,6 +122,8 @@ mlruns/
 outputs/
 checkpoints/
 models/
+finbert_model/
+gliner_model/
 results/
 
 # ============================
@@ -146,6 +149,7 @@ coverage.xml
 .mypy_cache/
 .ruff_cache/
 .dmypy.json
+WORKFLOW.md
 
 # ============================
 # Environment / Secrets

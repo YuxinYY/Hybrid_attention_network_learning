@@ -6,8 +6,8 @@ argparser = argparse.ArgumentParser()
 argparser.add_argument(
     '--submissionandcomments_dir',
     type=str,
-    default='data_processing/2023-2024.csv'
-    
+    default='data_processing/2023_sample.csv'
+
     # required=True,
     # help='Path to your private text data (not included due to license)'
 )
