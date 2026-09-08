@@ -1,11 +1,6 @@
 """
 从按年份过滤好的 Reddit ndjson 中抽取 pipeline 所需的列并抽样，产出 CSV。
 
-作用:
-    - 把 `streaming_filter.py` 产出的原始 ndjson 转成模型训练直接可用的表格格式。
-    - 只保留 `id, title, selftext, body, date, score` 六列。
-    - 支持按比例或固定数量抽样，用于快速验证 pipeline。
-
 用法:
     python data_processing/scripts/prepare_reddit_csv.py \
         --input "data_processing/reddit/wallstreetbets_submissions_2023.ndjson" \

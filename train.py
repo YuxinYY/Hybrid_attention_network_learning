@@ -18,11 +18,11 @@ class ClassificationTrainer:
         self.save_path = Path(save_path)
         self.save_path.mkdir(parents=True, exist_ok=True)
         
-        self.best_pos_f1 = 0.0
+        self.best_risk_f1 = 0.0
         self.history = {
             'train_loss': [], 'val_loss': [], 
             'val_acc': [], 'val_macro_f1': [], 'val_weighted_f1': [],
-            'pos_prec': [], 'pos_recall': [], 'pos_f1': []
+            'risk_prec': [], 'risk_recall': [], 'risk_f1': []
         }
     
     def train_epoch(self):
@@ -41,11 +41,9 @@ class ClassificationTrainer:
         for batch in pbar:
             x_text = batch['x_text'].to(self.device)
             x_mask = batch['x_mask'].to(self.device)
-            # day features 是可选的：dataset 只在 D>0 时才放这个 key
-            x_day = batch['x_day_feat'].to(self.device) if 'x_day_feat' in batch else None
             y = batch['y'].to(self.device).long() 
             
-            logits, _, _ = self.model(x_text, x_mask, x_day)
+            logits, _, _ = self.model(x_text, x_mask)
             loss = self.criterion(logits, y)
             
             self.optimizer.zero_grad()
@@ -69,10 +67,9 @@ class ClassificationTrainer:
             for batch in self.val_loader:
                 x_text = batch['x_text'].to(self.device)
                 x_mask = batch['x_mask'].to(self.device)
-                x_day = batch['x_day_feat'].to(self.device) if 'x_day_feat' in batch else None
                 y = batch['y'].to(self.device).long()
                 
-                logits, _, _ = self.model(x_text, x_mask, x_day)
+                logits, _, _ = self.model(x_text, x_mask)
                 loss = self.criterion(logits, y)
                 total_loss += loss.item()
                 
@@ -87,8 +84,8 @@ class ClassificationTrainer:
         macro_f1 = f1_score(all_targets, all_preds, average='macro')
         weighted_f1 = f1_score(all_targets, all_preds, average='weighted', zero_division=0)
         
-        # 正类(Outperform)指标
-        pos_prec, pos_recall, pos_f1, _ = precision_recall_fscore_support(
+        # Risk类指标
+        risk_prec, risk_recall, risk_f1, _ = precision_recall_fscore_support(
             all_targets, all_preds, 
             labels=[1], 
             average='binary', 
@@ -96,20 +93,20 @@ class ClassificationTrainer:
         )
         
         # 兼容处理结果
-        pos_prec = pos_prec.item() if hasattr(pos_prec, 'item') else pos_prec
-        pos_recall = pos_recall.item() if hasattr(pos_recall, 'item') else pos_recall
-        pos_f1 = pos_f1.item() if hasattr(pos_f1, 'item') else pos_f1
+        risk_prec = risk_prec.item() if hasattr(risk_prec, 'item') else risk_prec
+        risk_recall = risk_recall.item() if hasattr(risk_recall, 'item') else risk_recall
+        risk_f1 = risk_f1.item() if hasattr(risk_f1, 'item') else risk_f1
         
         print(f"\n📊 Epoch {epoch_idx+1} Confusion Matrix:")
         cm = confusion_matrix(all_targets, all_preds)
         if cm.shape == (2, 2):
-            print(f"           Pred_Under  Pred_Out")
+            print(f"           Pred_Safe  Pred_Risk")
             print(f"Actual_0: {cm[0][0]:^10} {cm[0][1]:^10}")
             print(f"Actual_1: {cm[1][0]:^10} {cm[1][1]:^10}")
         else:
             print(cm)
                 
-        return acc, macro_f1, weighted_f1, pos_prec, pos_recall, pos_f1, total_loss / len(self.val_loader)
+        return acc, macro_f1, weighted_f1, risk_prec, risk_recall, risk_f1, total_loss / len(self.val_loader)
         
     def train(self, num_epochs, patience=3):  # 新增patience参数（早停耐心值）
         print(f"🚀 Start Classification Training on {self.device}...")
@@ -117,11 +114,12 @@ class ClassificationTrainer:
         # 早停初始化
         best_val_loss = float('inf')  # 监控验证集Loss（核心）
         stop_count = 0                # 连续不提升的epoch数
-        best_pos_f1 = 0.0            # 保留最佳Pos F1
+        best_risk_f1 = -1.0           # Save the first epoch even when F1 is zero.
+        self.best_epoch = None
         
         for epoch in range(num_epochs):
             train_loss = self.train_epoch()
-            val_acc, val_macro_f1, val_weighted_f1, pos_prec, pos_recall, pos_f1, val_loss = self.validate(epoch)
+            val_acc, val_macro_f1, val_weighted_f1, risk_prec, risk_recall, risk_f1, val_loss = self.validate(epoch)
             
             # Scheduler step（基于验证集Loss）
             if self.scheduler:
@@ -136,20 +134,21 @@ class ClassificationTrainer:
             self.history['val_acc'].append(val_acc)
             self.history['val_macro_f1'].append(val_macro_f1)
             self.history['val_weighted_f1'].append(val_weighted_f1)
-            self.history['pos_prec'].append(pos_prec)
-            self.history['pos_recall'].append(pos_recall)
-            self.history['pos_f1'].append(pos_f1)
+            self.history['risk_prec'].append(risk_prec)
+            self.history['risk_recall'].append(risk_recall)
+            self.history['risk_f1'].append(risk_f1)
             
             # 打印指标
             print(f"Epoch {epoch+1}/{num_epochs} | "
                 f"Train Loss: {train_loss:.4f} | Val Loss: {val_loss:.4f} | "
-                f"Acc: {val_acc:.4%} | Pos F1: {pos_f1:.4f} (Prec: {pos_prec:.4f}, Recall: {pos_recall:.4f})")
+                f"Acc: {val_acc:.4%} | Risk F1: {risk_f1:.4f} (Prec: {risk_prec:.4f}, Recall: {risk_recall:.4f})")
             
-            # 保存最佳模型（基于Pos F1）
-            if pos_f1 > best_pos_f1:
-                best_pos_f1 = pos_f1
+            # 保存最佳模型（基于Risk F1）
+            if risk_f1 > best_risk_f1:
+                best_risk_f1 = risk_f1
+                self.best_epoch = epoch + 1
                 torch.save(self.model.state_dict(), self.save_path / "best_model.pt")
-                print(f"New Best Pos F1 Saved! (Current Best: {best_pos_f1:.4f})")
+                print(f"New Best Risk F1 Saved! (Current Best: {best_risk_f1:.4f})")
             
             # 早停逻辑（监控验证集Loss）
             if val_loss < best_val_loss:
@@ -161,7 +160,7 @@ class ClassificationTrainer:
                 print(f"Validation Loss Not Improved! Count: {stop_count}/{patience}")
                 if stop_count >= patience:
                     print(f"❌ Early Stopping Triggered! Stop at Epoch {epoch+1}")
-                    print(f"Best Pos F1: {best_pos_f1:.4f}, Best Val Loss: {best_val_loss:.4f}")
+                    print(f"Best Risk F1: {best_risk_f1:.4f}, Best Val Loss: {best_val_loss:.4f}")
                     break  # 终止训练
         
         print("✅ Training Complete.")

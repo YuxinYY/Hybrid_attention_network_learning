@@ -1,20 +1,3 @@
-"""
-从 Academic Torrent 下载的原始 Reddit 数据中，按年份过滤出指定年份的 submissions / comments。
-
-作用:
-    - 自动识别 zstd 压缩文件和普通 ndjson 文本文件。
-    - 一次流式读取原始文件，根据 `created_utc` 时间戳把记录写入多个按年份划分的输出文件。
-    - 输出供 `prepare_reddit_csv.py` 和 `count_cashtags.py` 使用的 `wallstreetbets_submissions_YYYY.ndjson` /
-      `wallstreetbets_comments_YYYY.ndjson`。
-
-用法:
-    python data_processing/scripts/streaming_filter.py
-
-注意:
-    - 原始文件路径在脚本底部 `__main__` 中硬编码，默认读取 `data_processing/reddit/subreddits25/`。
-    - 输出目录默认是 `data_processing/reddit/`。
-"""
-
 import zstandard as zstd
 import json
 import io
